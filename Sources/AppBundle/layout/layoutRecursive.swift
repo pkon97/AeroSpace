@@ -95,6 +95,16 @@ extension Window {
 
     @MainActor
     fileprivate func layoutFullscreen(_ context: LayoutContext) {
+        // FocusTile patch: --frame holds the window at a custom fractional rect of the monitor's
+        // visible area (the window stays in the tiling tree, so neighbors never move).
+        if let f = fullscreenFrame {
+            let m = context.workspace.workspaceMonitor.visibleRect
+            setAxFrame(
+                CGPoint(x: m.topLeftX + f.x * m.width, y: m.topLeftY + f.y * m.height),
+                CGSize(width: f.w * m.width, height: f.h * m.height),
+            )
+            return
+        }
         let monitorRect = noOuterGapsInFullscreen
             ? context.workspace.workspaceMonitor.visibleRect
             : context.workspace.workspaceMonitor.visibleRectPaddedByOuterGaps

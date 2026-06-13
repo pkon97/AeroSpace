@@ -7,6 +7,7 @@ open class Window: TreeNode, Hashable {
     var lastFloatingSize: CGSize?
     var isFullscreen: Bool = false
     var noOuterGapsInFullscreen: Bool = false
+    var fullscreenFrame: FractionRect? = nil // FocusTile patch: custom fractional frame for fullscreen
     var layoutReason: LayoutReason = .standard
 
     @MainActor

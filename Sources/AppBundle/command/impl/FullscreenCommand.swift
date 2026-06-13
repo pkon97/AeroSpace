@@ -22,6 +22,7 @@ struct FullscreenCommand: Command {
         }
         window.isFullscreen = newState
         window.noOuterGapsInFullscreen = args.noOuterGaps
+        window.fullscreenFrame = args.frame // FocusTile patch: nil unless --frame given
 
         // Focus on its own workspace
         window.markAsMostRecentChild()

@@ -9,8 +9,8 @@ include::util/man-attributes.adoc[]
 == Synopsis
 [verse]
 // tag::synopsis[]
-aerospace fullscreen [-h|--help]     [--window-id <window-id>] [--no-outer-gaps]
-aerospace fullscreen [-h|--help] on  [--window-id <window-id>] [--no-outer-gaps] [--fail-if-noop]
+aerospace fullscreen [-h|--help]     [--window-id <window-id>] [--no-outer-gaps] [--frame <x,y,w,h>]
+aerospace fullscreen [-h|--help] on  [--window-id <window-id>] [--no-outer-gaps] [--frame <x,y,w,h>] [--fail-if-noop]
 aerospace fullscreen [-h|--help] off [--window-id <window-id>] [--fail-if-noop]
 
 // end::synopsis[]
@@ -28,6 +28,10 @@ include::./util/conditional-options-header.adoc[]
 
 -h, --help:: Print help
 --no-outer-gaps:: Remove the outer gaps when in fullscreen mode
+--frame <x,y,w,h>::
+Hold the window at a custom rectangle instead of the whole monitor.
+`x,y,w,h` are fractions (0-1) of the monitor's visible area (e.g. `0.1,0.1,0.8,0.8`).
+The window stays in the tiling tree, so other windows don't move
 --fail-if-noop:: Exit with non-zero exit code if already fullscreen or already not fullscreen
 
 --window-id <window-id>::
