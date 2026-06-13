@@ -16,6 +16,15 @@ struct FullscreenCommand: Command {
             case .toggle: !window.isFullscreen
         }
         if newState == window.isFullscreen {
+            // FocusTile patch: already in the target state — but if we're (still) fullscreen and a
+            // NEW --frame was given, update the frame instead of no-op'ing. The unconditional
+            // layoutWorkspaces() after every command then re-applies it. Without this, nudging the
+            // zoom frame (re-issuing `fullscreen on --frame`) would silently do nothing.
+            if newState, let f = args.frame, window.fullscreenFrame != f {
+                window.fullscreenFrame = f
+                window.markAsMostRecentChild()
+                return true
+            }
             io.err((newState ? "Already fullscreen. " : "Already not fullscreen. ") +
                 "Tip: use --fail-if-noop to exit with non-zero code")
             return !args.failIfNoop
