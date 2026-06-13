@@ -98,7 +98,10 @@ extension Window {
         // FocusTile patch: --frame holds the window at a custom fractional rect of the monitor's
         // visible area (the window stays in the tiling tree, so neighbors never move).
         if let f = fullscreenFrame {
-            let m = context.workspace.workspaceMonitor.visibleRect
+            // FocusTile: measure the custom frame from the gap-PADDED area (same inset the tiles use),
+            // so a frame edge pushed to 0 or 1 lines up exactly with the neighbouring tiled windows'
+            // outer edges — no snapping needed.
+            let m = context.workspace.workspaceMonitor.visibleRectPaddedByOuterGaps
             setAxFrame(
                 CGPoint(x: m.topLeftX + f.x * m.width, y: m.topLeftY + f.y * m.height),
                 CGSize(width: f.w * m.width, height: f.h * m.height),

@@ -6,7 +6,9 @@ import PrivateApi
 func checkAccessibilityPermissions() {
     let options = [axTrustedCheckOptionPrompt: true]
     if !AXIsProcessTrustedWithOptions(options as CFDictionary) {
-        resetAccessibility() // Because macOS doesn't reset it for us when the app signature changes...
+        // FocusTile: skip resetAccessibility() — it wipes the TCC entry the prompt just created,
+        // so the grant can't simply be toggled on. Clear stale grants across rebuilds manually with
+        // `tccutil reset Accessibility bobko.aerospace.debug` if ever needed.
         terminateApp()
     }
 }
