@@ -121,9 +121,15 @@ extension Monitor {
         }
         // What if monitor configuration changed? (frame.origin is changed)
         rearrangeWorkspacesOnMonitors()
-        // Normally, recursion should happen only once more because we must take the value from the cache
-        // (Unless, monitor configuration data race happens)
-        return self.activeWorkspace
+        // Normally the rearrange above caches this monitor's workspace and we return it here.
+        // But during a monitor (dis)connect race, self's point may no longer be a current
+        // monitor, so the cache can still miss — and `return self.activeWorkspace` would recurse
+        // unboundedly and overflow the stack (issue #506, crash on dock/undock). Recurse at most
+        // once: on a persistent miss, fall back to a stub for this point instead of recursing.
+        if let existing = screenPointToVisibleWorkspace[rect.topLeftCorner] {
+            return existing
+        }
+        return getStubWorkspace(forPoint: rect.topLeftCorner)
     }
 
     @MainActor
