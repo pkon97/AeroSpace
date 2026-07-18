@@ -26,6 +26,12 @@ final class TestWindow: Window, CustomStringConvertible {
         TestApp.shared.focusedWindow = self
     }
 
+    private(set) var lastSetNativeMinimized: Bool? = nil
+    @MainActor
+    override func setNativeMinimized(_ value: Bool) {
+        lastSetNativeMinimized = value
+    }
+
     override func closeAxWindow() {
         unbindFromParent()
     }

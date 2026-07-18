@@ -39,6 +39,8 @@ open class Window: TreeNode, Hashable {
     var isHiddenInCorner: Bool { die("Not implemented") }
     @MainActor
     func nativeFocus() { die("Not implemented") }
+    @MainActor
+    func setNativeMinimized(_ value: Bool) { die("Not implemented") }
     func getAxRect() async throws -> Rect? { die("Not implemented") }
     func getCenter() async throws -> CGPoint? { try await getAxRect()?.center }
 

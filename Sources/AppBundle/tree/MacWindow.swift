@@ -73,7 +73,7 @@ final class MacWindow: Window {
         macApp.setNativeFullscreen(windowId, value)
     }
 
-    func setNativeMinimized(_ value: Bool) {
+    override func setNativeMinimized(_ value: Bool) {
         macApp.setNativeMinimized(windowId, value)
     }
 

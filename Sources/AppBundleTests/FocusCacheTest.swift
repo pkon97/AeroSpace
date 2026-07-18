@@ -104,4 +104,45 @@ final class FocusCacheTest: XCTestCase {
         assertEquals(ws.mostRecentWindowRecursive(where: { $0.windowId == 999 }), nil)
         _ = (target, other)
     }
+
+    // Behavior 4: app's only window is minimized => un-minimize it (the native restore path then lands it on
+    // the focused workspace). Driven directly, since NSWorkspace.frontmostApplication reports the test runner.
+    func testRestoreMostRecentMinimizedWindowUnminimizesIt() {
+        let w = TestWindow.new(id: 1, parent: macosMinimizedWindowsContainer)
+        assertEquals(w.lastSetNativeMinimized, nil)
+
+        restoreMostRecentMinimizedWindow(ofApp: TestApp.shared.pid)
+
+        assertEquals(w.lastSetNativeMinimized, false) // un-minimize requested
+    }
+
+    // Behavior 4 picks the most-recently-minimized window when several are minimized.
+    func testRestorePicksMostRecentMinimized() {
+        let w1 = TestWindow.new(id: 1, parent: macosMinimizedWindowsContainer)
+        let w2 = TestWindow.new(id: 2, parent: macosMinimizedWindowsContainer) // bound later => MRU
+
+        restoreMostRecentMinimizedWindow(ofApp: TestApp.shared.pid)
+
+        assertEquals(w2.lastSetNativeMinimized, false)
+        assertEquals(w1.lastSetNativeMinimized, nil)
+    }
+
+    // No minimized windows for the app => no-op (app with zero windows).
+    func testRestoreNoMinimizedWindowsIsNoop() {
+        restoreMostRecentMinimizedWindow(ofApp: TestApp.shared.pid) // container empty; must not crash
+    }
+
+    // Behavior 4 must NOT fire when the app has a non-minimized focused window (the Chrome case): macOS hands
+    // updateFocusCache a real window, so the nil branch is never taken and the minimized one is left alone.
+    func testDoesNotRestoreWhenAppHasNonMinimizedFocusedWindow() {
+        let visible = focus.workspace
+        let minimized = TestWindow.new(id: 1, parent: macosMinimizedWindowsContainer)
+        let w2 = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        lastKnownFrontmostAppPid = nil
+
+        updateFocusCache(w2) // non-nil focused window => nil branch not taken
+
+        assertEquals(minimized.lastSetNativeMinimized, nil) // behavior 4 did not fire
+        assertEquals(focus.windowOrNil?.windowId, 2)
+    }
 }

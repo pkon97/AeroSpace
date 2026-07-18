@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 @MainActor private var lastKnownNativeFocusedWindowId: UInt32? = nil
@@ -37,6 +38,15 @@ struct PendingRedirect {
     // target): MacApp.nativeFocus skips AX and merely activate()s when lastNativeFocusedWindowId matches,
     // which would leave the app focused on its own pick. See MacApp.swift nativeFocus fast-path.
     (nativeFocused?.app as? MacApp)?.lastNativeFocusedWindowId = nativeFocused?.windowId
+
+    // Behavior 4: activation landed on an app with no focusable (non-minimized) window -- its only window(s)
+    // are minimized, so macOS handed us nil. Un-minimize the most-recent one; the native restore path lands
+    // it on focus.workspace (parity with clicking the Dock icon). If the app has *any* non-minimized window,
+    // macOS focuses it instead (nativeFocused != nil) and this branch is never reached -- so an app with a
+    // window open elsewhere still snaps to that window. Falls through so the tail clears the cache as before.
+    if nativeFocused == nil {
+        restoreMinimizedWindowOnActivation()
+    }
 
     let effective = resolveFocusPreferringVisibleWorkspace(nativeFocused)
 
@@ -116,6 +126,30 @@ private func mostRecentWindowOnVisibleWorkspace(ofApp pid: Int32) -> Window? {
         if let window = workspace.mostRecentWindowRecursive(where: { $0.app.pid == pid }) { return window }
     }
     return nil
+}
+
+/// Behavior 4 wrapper. The focused window was nil, so the pid must come from the frontmost app rather than
+/// from a window. Gated on app activation (same pid semantics as resolveFocusPreferringVisibleWorkspace) so
+/// unrelated nil-focus refreshes don't spuriously un-minimize. Keeps lastKnownFrontmostAppPid coherent.
+@MainActor
+private func restoreMinimizedWindowOnActivation() {
+    guard let frontmost = NSWorkspace.shared.frontmostApplication else { return }
+    let pid = frontmost.processIdentifier
+    let isAppActivation = pid != lastKnownFrontmostAppPid
+    lastKnownFrontmostAppPid = pid
+    guard isAppActivation else { return }
+    restoreMostRecentMinimizedWindow(ofApp: pid)
+}
+
+/// Un-minimize the app's most-recently-minimized window. macOS then restores it, and the native
+/// normalizeLayoutReason path binds it to focus.workspace. `internal` so behavior 4 is unit-testable
+/// without going through NSWorkspace (which reports the test runner, not TestApp).
+@MainActor
+func restoreMostRecentMinimizedWindow(ofApp pid: Int32) {
+    macosMinimizedWindowsContainer.mruChildren
+        .compactMap { $0 as? Window }
+        .first { $0.app.pid == pid }?
+        .setNativeMinimized(false)
 }
 
 @MainActor private var summonApps: (mtime: Date, ids: Set<String>)? = nil
