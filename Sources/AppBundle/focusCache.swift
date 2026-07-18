@@ -7,6 +7,9 @@ import Foundation
 // so tests can reset them in setUpWorkspacesForTests -- they're process-global.
 @MainActor var lastKnownFrontmostAppPid: Int32? = nil
 @MainActor var pendingRedirect: PendingRedirect? = nil
+/// Last window we settled focus on, per app pid. Lets us reveal "the window you were just on" when macOS
+/// activates an app but hands us no focused window (behavior 4b). Updated at the end of updateFocusCache.
+@MainActor var appLastFocusedWindow: [Int32: UInt32] = [:]
 /// Tests set this to bypass the on-disk summon list. Reset to nil in setUpWorkspacesForTests.
 @MainActor var summonAppsOverrideForTests: Set<String>? = nil
 
@@ -97,6 +100,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
     summonAppsOverrideForTests = nil
     summonApps = nil
     recentBumps = []
+    appLastFocusedWindow = [:]
 }
 
 /// The data should flow (from nativeFocused to focused) and
@@ -118,7 +122,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
     // macOS focuses it instead (nativeFocused != nil) and this branch is never reached -- so an app with a
     // window open elsewhere still snaps to that window. Falls through so the tail clears the cache as before.
     if nativeFocused == nil {
-        restoreMinimizedWindowOnActivation()
+        revealAppWindowOnActivation()
     }
 
     let effective = resolveFocusPreferringVisibleWorkspace(nativeFocused)
@@ -130,6 +134,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
     if let effective, effective !== nativeFocused {
         effective.nativeFocus() // syncFocusToMacOs: macOS still believes nativeFocused has the focus
     }
+    if let effective { appLastFocusedWindow[effective.app.pid] = effective.windowId } // remember per-app last window
 
     ageBumpRecords() // Behavior 5, Phase A: TTL so the bump queue can't grow unbounded
 }
@@ -224,40 +229,54 @@ private func mostRecentWindowOnVisibleWorkspace(ofApp pid: Int32) -> Window? {
     return nil
 }
 
-/// Behavior 4 wrapper. The focused window was nil, so the pid must come from the frontmost app rather than
-/// from a window. Gated on app activation (same pid semantics as resolveFocusPreferringVisibleWorkspace) so
-/// unrelated nil-focus refreshes don't spuriously un-minimize. Keeps lastKnownFrontmostAppPid coherent.
+/// The focused window was nil (macOS activated an app but gave us no window -- e.g. Finder focusing its
+/// desktop). The pid comes from the frontmost app. Gated on app activation so unrelated nil-focus refreshes
+/// don't act; keeps lastKnownFrontmostAppPid coherent.
+/// - Behavior 4: minimized-only app => un-minimize its most-recent window.
+/// - Behavior 4b: app has real windows elsewhere but macOS focused none => reveal the one you were last on.
 @MainActor
-private func restoreMinimizedWindowOnActivation() {
+private func revealAppWindowOnActivation() {
     guard let frontmost = NSWorkspace.shared.frontmostApplication else { return }
     let pid = frontmost.processIdentifier
     let isAppActivation = pid != lastKnownFrontmostAppPid
     lastKnownFrontmostAppPid = pid
     guard isAppActivation else { return }
+    let app = frontmost.bundleIdentifier ?? "?"
 
-    // Diagnostics: macOS activated an app but handed us NO focused window (e.g. Finder focusing its
-    // desktop). Log where the app's real windows actually are -- if they sit on other workspaces while
-    // we do nothing, that's the "Cmd+Tab lands on no window" symptom.
-    let onWorkspaces = Workspace.all.flatMap { ws in
-        ws.allLeafWindowsRecursive.filter { $0.app.pid == pid }.map { "\($0.windowId)@\(ws.name)" }
+    // Behavior 4: minimized-only app => un-minimize (native restore lands it on focus.workspace).
+    if let minimized = mostRecentMinimizedWindow(ofApp: pid) {
+        b5trace("CMDTAB app=\(app) NIL -> un-minimize win=\(minimized.windowId) [behavior 4]")
+        minimized.setNativeMinimized(false)
+        return
     }
-    let minimized = macosMinimizedWindowsContainer.mruChildren.compactMap { $0 as? Window }
-        .filter { $0.app.pid == pid }.map { $0.windowId }
-    b5trace("CMDTAB app=\(frontmost.bundleIdentifier ?? "?") macOS-picked NIL (no window)"
-        + " -> app windows on workspaces=\(onWorkspaces) minimized=\(minimized)")
 
-    restoreMostRecentMinimizedWindow(ofApp: pid)
+    // Behavior 4b: macOS gave nil but the app has real windows => reveal the one you were last on.
+    guard let target = mostRecentWindowToReveal(ofApp: pid) else {
+        b5trace("CMDTAB app=\(app) NIL -> no window to reveal")
+        return
+    }
+    b5trace("CMDTAB app=\(app) NIL -> REVEAL win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 4b]")
+    _ = target.focusWindow()
+    target.nativeFocus()
 }
 
-/// Un-minimize the app's most-recently-minimized window. macOS then restores it, and the native
-/// normalizeLayoutReason path binds it to focus.workspace. `internal` so behavior 4 is unit-testable
-/// without going through NSWorkspace (which reports the test runner, not TestApp).
 @MainActor
-func restoreMostRecentMinimizedWindow(ofApp pid: Int32) {
-    macosMinimizedWindowsContainer.mruChildren
-        .compactMap { $0 as? Window }
-        .first { $0.app.pid == pid }?
-        .setNativeMinimized(false)
+func mostRecentMinimizedWindow(ofApp pid: Int32) -> Window? {
+    macosMinimizedWindowsContainer.mruChildren.compactMap { $0 as? Window }.first { $0.app.pid == pid }
+}
+
+/// The app's window to reveal when macOS focused none: the exact window you were last on (per-app memory)
+/// if it still exists; else its MRU on the current visible workspace (no travel); else its MRU anywhere.
+/// `internal` so behavior 4b is unit-testable without NSWorkspace (which reports the test runner).
+@MainActor
+func mostRecentWindowToReveal(ofApp pid: Int32) -> Window? {
+    if let last = appLastFocusedWindow[pid].flatMap({ Window.get(byId: $0) }), last.nodeWorkspace != nil {
+        return last
+    }
+    if focus.workspace.isVisible, let here = focus.workspace.mostRecentWindowRecursive(where: { $0.app.pid == pid }) {
+        return here
+    }
+    return Workspace.all.lazy.compactMap { $0.mostRecentWindowRecursive(where: { $0.app.pid == pid }) }.first
 }
 
 @MainActor private var summonApps: (mtime: Date, ids: Set<String>)? = nil

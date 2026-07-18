@@ -111,7 +111,7 @@ final class FocusCacheTest: XCTestCase {
         let w = TestWindow.new(id: 1, parent: macosMinimizedWindowsContainer)
         assertEquals(w.lastSetNativeMinimized, nil)
 
-        restoreMostRecentMinimizedWindow(ofApp: TestApp.shared.pid)
+        mostRecentMinimizedWindow(ofApp: TestApp.shared.pid)?.setNativeMinimized(false)
 
         assertEquals(w.lastSetNativeMinimized, false) // un-minimize requested
     }
@@ -121,15 +121,33 @@ final class FocusCacheTest: XCTestCase {
         let w1 = TestWindow.new(id: 1, parent: macosMinimizedWindowsContainer)
         let w2 = TestWindow.new(id: 2, parent: macosMinimizedWindowsContainer) // bound later => MRU
 
-        restoreMostRecentMinimizedWindow(ofApp: TestApp.shared.pid)
-
-        assertEquals(w2.lastSetNativeMinimized, false)
-        assertEquals(w1.lastSetNativeMinimized, nil)
+        assertEquals(mostRecentMinimizedWindow(ofApp: TestApp.shared.pid)?.windowId, 2)
+        _ = (w1, w2)
     }
 
-    // No minimized windows for the app => no-op (app with zero windows).
-    func testRestoreNoMinimizedWindowsIsNoop() {
-        restoreMostRecentMinimizedWindow(ofApp: TestApp.shared.pid) // container empty; must not crash
+    // No minimized windows for the app => nil (nothing to un-minimize).
+    func testRestoreNoMinimizedWindowsIsNil() {
+        assertEquals(mostRecentMinimizedWindow(ofApp: TestApp.shared.pid), nil)
+    }
+
+    // Behavior 4b: macOS activated the app but gave no window; the app has real windows elsewhere. Reveal the
+    // exact window you were last on (per-app memory), even on another workspace.
+    func testRevealsLastFocusedWindowWhenMacOsGivesNil() {
+        let visible = focus.workspace
+        let elsewhere = Workspace.get(byName: "elsewhere-\(name)")
+        _ = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        _ = TestWindow.new(id: 9, parent: elsewhere.rootTilingContainer) // the one you were last on
+        appLastFocusedWindow[TestApp.shared.pid] = 9
+
+        assertEquals(mostRecentWindowToReveal(ofApp: TestApp.shared.pid)?.windowId, 9)
+    }
+
+    // Behavior 4b fallback: no per-app memory => reveal the app's MRU window on the current visible workspace.
+    func testRevealFallsBackToVisibleWorkspaceMru() {
+        let visible = focus.workspace
+        _ = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+
+        assertEquals(mostRecentWindowToReveal(ofApp: TestApp.shared.pid)?.windowId, 2)
     }
 
     // Behavior 4 must NOT fire when the app has a non-minimized focused window (the Chrome case): macOS hands
