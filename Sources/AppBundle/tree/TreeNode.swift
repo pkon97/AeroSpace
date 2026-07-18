@@ -117,6 +117,14 @@ open class TreeNode: Equatable, AeroAny {
         return iterator.next() ?? children.last
     }
 
+    /// Children ordered most-recently-used first. Children never marked (shouldn't happen -- `bind` marks
+    /// them) are appended last, in tree order. Same fallback spirit as `mostRecentChild`.
+    var mruChildren: [TreeNode] {
+        let mru = Array(_mruChildren)
+        let marked = mru.map(ObjectIdentifier.init).toSet()
+        return mru + children.filter { !marked.contains(ObjectIdentifier($0)) }
+    }
+
     @discardableResult
     func unbindFromParent() -> BindingData {
         unbindIfBound() ?? dieT("\(self) is already unbound. The stacktrace where it was unbound:\n\(unboundStacktrace ?? "nil")")

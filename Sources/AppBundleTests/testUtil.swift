@@ -38,6 +38,9 @@ func setUpWorkspacesForTests() {
 
     TestApp.shared.focusedWindow = nil
     TestApp.shared.windows = []
+
+    // Workspace-aware app-activation globals (focusCache.swift) are process-global; reset per test.
+    resetFocusCacheForTests()
 }
 
 extension ParsedCmd {

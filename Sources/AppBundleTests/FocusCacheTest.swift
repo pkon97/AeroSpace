@@ -1,0 +1,107 @@
+@testable import AppBundle
+import Common
+import XCTest
+
+@MainActor
+final class FocusCacheTest: XCTestCase {
+    override func setUp() async throws { setUpWorkspacesForTests() }
+
+    // Behavior 1: macOS activates the app onto a hidden-workspace window, but the app also has a window on a
+    // visible workspace => redirect to the visible one, don't get yanked to the hidden workspace.
+    func testPrefersVisibleWorkspaceWindowOnAppActivation() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+        TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        assertEquals(visible.isVisible, true)
+        assertEquals(hidden.isVisible, false)
+        lastKnownFrontmostAppPid = nil // arm "app activation"
+
+        updateFocusCache(Window.get(byId: 1)) // macOS: "the app focused its hidden-ws window"
+
+        assertEquals(focus.windowOrNil?.windowId, 2) // did NOT follow
+        assertEquals(focus.workspace, visible)
+        assertEquals(hidden.isVisible, false) // no yank
+        assertEquals(TestApp.shared.focusedWindow?.windowId, 2) // redirect was pushed to "macOS"
+    }
+
+    // Behavior 2: the app has no window on any visible workspace => following to the hidden one is correct.
+    func testFollowsWhenAppHasNoWindowOnAnyVisibleWorkspace() {
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+        lastKnownFrontmostAppPid = nil
+
+        updateFocusCache(w1)
+
+        assertEquals(focus.windowOrNil?.windowId, 1) // fallback: follow, as today
+        assertEquals(focus.workspace, hidden)
+    }
+
+    // Behavior 3: an opted-in app with no visible window => bring its window to the focused workspace.
+    func testSummonsListedAppWindowToFocusedWorkspace() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+        summonAppsOverrideForTests = [TestApp.shared.rawAppBundleId!]
+        lastKnownFrontmostAppPid = nil
+
+        updateFocusCache(w1)
+
+        assertEquals(w1.nodeWorkspace, visible) // window came to us
+        assertEquals(hidden.allLeafWindowsRecursive.count, 0) // and left the hidden workspace
+        assertEquals(focus.workspace, visible) // we did not travel
+        assertEquals(focus.windowOrNil?.windowId, 1)
+    }
+
+    // The pid gate: when the app was already frontmost (in-app window switch, e.g. cmd-`), honor macOS and
+    // follow even into a hidden workspace. Guards against fighting a deliberate within-app switch.
+    func testDoesNotRedirectWhenAppWasAlreadyFrontmost() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        let w2 = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+        lastKnownFrontmostAppPid = nil
+
+        updateFocusCache(w2)                 // activation lands on the visible window; arms the gate (pid 0)
+        assertEquals(focus.workspace, visible)
+
+        updateFocusCache(w1)                 // same app, now points at a hidden window => in-app switch
+
+        assertEquals(focus.windowOrNil?.windowId, 1) // followed
+        assertEquals(focus.workspace, hidden)
+    }
+
+    // Behavior 1 refinement: among several of the app's windows on the visible workspace, pick the MRU one.
+    func testPicksMruWindowAmongSeveralOnTheVisibleWorkspace() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        var w2: Window!
+        var w3: Window!
+        visible.rootTilingContainer.apply {
+            w2 = TestWindow.new(id: 2, parent: $0)
+            w3 = TestWindow.new(id: 3, parent: $0)
+        }
+        TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+        _ = w3 // silence unused; w3 is the latest-bound, so w2 must be explicitly promoted
+        w2.markAsMostRecentChild()
+        lastKnownFrontmostAppPid = nil
+
+        updateFocusCache(Window.get(byId: 1))
+
+        assertEquals(focus.windowOrNil?.windowId, 2) // the MRU window, not merely the last-bound (3)
+    }
+
+    // Pure-tree: the filtered, backtracking recursive accessor added in TreeNodeEx.
+    func testMostRecentWindowRecursiveWherePredicate() {
+        let ws = focus.workspace
+        var target: Window!
+        var other: Window!
+        ws.rootTilingContainer.apply {
+            other = TestWindow.new(id: 7, parent: $0)
+            target = TestWindow.new(id: 8, parent: $0)
+        }
+        assertEquals(ws.mostRecentWindowRecursive(where: { $0.windowId == 7 })?.windowId, 7) // backtracks off MRU (8)
+        assertEquals(ws.mostRecentWindowRecursive(where: { $0.windowId == 999 }), nil)
+        _ = (target, other)
+    }
+}

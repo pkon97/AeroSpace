@@ -49,6 +49,16 @@ extension TreeNode {
         self as? Window ?? mostRecentChild?.mostRecentWindowRecursive
     }
 
+    /// Like ``mostRecentWindowRecursive``, but only considers windows matching `predicate`, and backtracks
+    /// into less-recent branches instead of giving up when the MRU branch has no match.
+    func mostRecentWindowRecursive(where predicate: (Window) -> Bool) -> Window? {
+        if let window = self as? Window { return predicate(window) ? window : nil }
+        for child in mruChildren {
+            if let found = child.mostRecentWindowRecursive(where: predicate) { return found }
+        }
+        return nil
+    }
+
     var anyLeafWindowRecursive: Window? {
         if let window = self as? Window {
             return window
