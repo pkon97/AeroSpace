@@ -149,7 +149,13 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
 
     // Minimized/popup/unparented windows bind to NilTreeNode => not our business
     guard let nativeWorkspace = nativeFocused.nodeWorkspace else { pendingRedirect = nil; return nativeFocused }
-    if nativeWorkspace.isVisible { pendingRedirect = nil; return nativeFocused }
+    if nativeWorkspace.isVisible {
+        pendingRedirect = nil
+        // Cmd+Tab diagnostics: macOS picked a window that's already on a visible workspace -> we accept it.
+        // If this is the wrong window (not the one you were last on), macOS's own pick is the culprit.
+        if isAppActivation { cmdtabTrace(nativeFocused, "ACCEPT (macOS pick already on visible ws=\(nativeWorkspace.name))") }
+        return nativeFocused
+    }
 
     // ---- macOS focused a window on a hidden workspace ----
 
@@ -172,6 +178,7 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
 
     // Behavior 1: prefer an existing window of this app on a visible workspace. Redirect, move nothing.
     if let target = mostRecentWindowOnVisibleWorkspace(ofApp: pid) {
+        cmdtabTrace(nativeFocused, "REDIRECT to win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 1]")
         pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: pid, targetWindowId: target.windowId, attemptsLeft: 3)
         return target
     }
@@ -185,11 +192,23 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
         // workspace (layout untouched); tiled binds to the root tiling container (re-tiles -- hence opt-in).
         let container: NonLeafTreeNodeObject = nativeFocused.isFloating ? here : here.rootTilingContainer
         nativeFocused.bind(to: container, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
+        cmdtabTrace(nativeFocused, "SUMMON to ws=\(here.name) [behavior 3]")
         return nativeFocused
     }
 
     // Behavior 2: no visible window, not opted in => following is correct and desirable.
+    cmdtabTrace(nativeFocused, "FOLLOW/travel to ws=\(nativeWorkspace.name) [behavior 2]")
     return nativeFocused
+}
+
+/// Cmd+Tab (app-activation) diagnostics: what window macOS picked on activation and what we did with it.
+/// Answers "why didn't tabbing back land on the window I was just on?" -- if macOS's pick is the wrong
+/// window, the fix is on our side (remember last-used window per app); if it's right but we redirect, it's
+/// behavior 1/3.
+@MainActor private func cmdtabTrace(_ nativeFocused: Window, _ decision: String) {
+    let ws = nativeFocused.nodeWorkspace?.name ?? "nil"
+    let app = nativeFocused.app.rawAppBundleId ?? "?"
+    b5trace("CMDTAB app=\(app) macOS-picked win=\(nativeFocused.windowId) ws=\(ws) -> \(decision)")
 }
 
 @MainActor
