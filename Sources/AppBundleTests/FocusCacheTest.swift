@@ -164,7 +164,7 @@ final class FocusCacheTest: XCTestCase {
         assertEquals(focus.windowOrNil?.windowId, 2)
     }
 
-    // Behavior 5 (Phase B): a minimize bump keeps focus on the workspace you were on instead of
+    // Behavior 5: a minimize bump keeps focus on the workspace you were on instead of
     // following macOS to the hidden-workspace window it picked. (Same-app-vs-cross-app *preference*
     // needs a second test app -- validated live; here every TestWindow shares TestApp, so this
     // exercises the "window on `here`" redirect via the same-app branch.)

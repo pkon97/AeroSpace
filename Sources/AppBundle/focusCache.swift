@@ -20,11 +20,17 @@ struct PendingRedirect {
     var attemptsLeft: Int
 }
 
-// ---- Behavior 5, Phase A: instrumentation only (no redirect yet) ----
-// A minimize/close bumps macOS focus to another same-app window that may live on a hidden workspace,
-// dragging you there. Phase A records the minimize as a BumpEvent and LOGS, at the moment of the
-// resulting focus follow, whether the record was already present -- answering the open question of
-// whether the AX miniaturize event lands before or after the focus refresh. No behavior change yet.
+// Focus-decision tracing for development. No-op unless AEROSPACE_FOCUS_TRACE is set in the environment
+// (add it to launchd/com.workstation-ux.aerospace.plist, then restart via aerospace/rebuild-restart.sh).
+// When on, every focus decision below prints "FOCUS ..." to stderr -> ~/.local/state/.../aerospace.err.log.
+// The @autoclosure means the message string is only built when tracing is enabled, so it's free when off.
+let focusTraceEnabled = ProcessInfo.processInfo.environment["AEROSPACE_FOCUS_TRACE"] != nil
+func focusTrace(_ msg: @autoclosure () -> String) {
+    if focusTraceEnabled { fputs("FOCUS " + msg() + "\n", stderr) }
+}
+
+// Behavior 5: a minimize bumps macOS focus to another same-app window that may live on a hidden workspace,
+// dragging you there. bumpObs records the minimize as a BumpEvent; resolveBump uses it to keep you put.
 struct BumpEvent {
     let windowId: UInt32
     let workspaceName: String
@@ -33,14 +39,9 @@ struct BumpEvent {
 @MainActor var recentBumps: [BumpEvent] = []
 private let bumpTtlRefreshes = 2
 
-// Unbuffered so lines land in aerospace.err.log immediately (stdout under launchd is block-buffered).
-func b5trace(_ msg: @autoclosure () -> String) {
-    fputs("B5PHASEA " + msg() + "\n", stderr)
-}
-
-/// AX handler for `kAXWindowMiniaturizedNotification` (split out of refreshObs for Phase A). The element
-/// is still alive on a minimize, so `containingWindowId()` recovers the id; the window's `nodeWorkspace`
-/// is captured before normalizeLayoutReason re-parents it. Then refresh as usual, exactly like refreshObs.
+/// AX handler for `kAXWindowMiniaturizedNotification` (split out of refreshObs). The element is still alive
+/// on a minimize, so `containingWindowId()` recovers the id; the window's `nodeWorkspace` is captured before
+/// normalizeLayoutReason re-parents it. Then refresh as usual, exactly like refreshObs.
 func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMutableRawPointer?) {
     let windowId = ax.containingWindowId()
     let notif = notif as String
@@ -49,7 +50,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
         if let windowId {
             let ws = Window.get(byId: windowId)?.nodeWorkspace?.name
             recentBumps.append(BumpEvent(windowId: windowId, workspaceName: ws ?? "", ttlRefreshes: bumpTtlRefreshes))
-            b5trace("BUMP-EVENT miniaturize win=\(windowId) ws=\(ws ?? "nil") queued=\(recentBumps.count)")
+            focusTrace("bump-event miniaturize win=\(windowId) ws=\(ws ?? "nil") queued=\(recentBumps.count)")
         }
         scheduleRefreshSession(.ax(notif))
     }
@@ -74,7 +75,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
 @MainActor private func resolveBump(_ nativeFocused: Window, _ pid: Int32) -> Window? {
     let toWs = nativeFocused.nodeWorkspace?.name ?? "nil"
     guard let bump = recentBumps.last, !bump.workspaceName.isEmpty else {
-        b5trace("BUMP none: non-activation follow->ws=\(toWs) (deliberate switch or not-yet-arrived) => follow")
+        focusTrace("bump none: non-activation follow->ws=\(toWs) (deliberate switch or not-yet-arrived) => follow")
         return nil
     }
     recentBumps.removeLast() // consume-on-use
@@ -82,12 +83,11 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
     guard let target = here.mostRecentWindowRecursive(where: { $0.app.pid == pid })   // same app on `here`
         ?? here.mostRecentWindowRecursive(where: { _ in true })                       // else anything on `here`
     else {
-        b5trace("BUMP win=\(bump.windowId) here=\(bump.workspaceName) now empty => allow follow->ws=\(toWs)")
-        return nil
+        focusTrace("bump win=\(bump.windowId) here=\(bump.workspaceName) now empty => allow follow->ws=\(toWs)")
+        return nil // `here` now empty => allow follow (deferred empty-workspace case)
     }
     pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: target.app.pid, targetWindowId: target.windowId, attemptsLeft: 3)
-    b5trace("BUMP-REDIRECT win=\(bump.windowId) keep ws=\(bump.workspaceName) target=\(target.windowId)"
-        + " (macOS was following to ws=\(toWs); hereVisible=\(here.isVisible))")
+    focusTrace("bump-redirect win=\(bump.windowId) keep ws=\(bump.workspaceName) target=\(target.windowId)")
     return target
 }
 
@@ -136,7 +136,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
     }
     if let effective { appLastFocusedWindow[effective.app.pid] = effective.windowId } // remember per-app last window
 
-    ageBumpRecords() // Behavior 5, Phase A: TTL so the bump queue can't grow unbounded
+    ageBumpRecords() // Behavior 5: TTL so unconsumed bump records can't accumulate
 }
 
 /// macOS activates *applications*; the app then picks which window to focus from its own MRU, which knows
@@ -156,9 +156,7 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
     guard let nativeWorkspace = nativeFocused.nodeWorkspace else { pendingRedirect = nil; return nativeFocused }
     if nativeWorkspace.isVisible {
         pendingRedirect = nil
-        // Cmd+Tab diagnostics: macOS picked a window that's already on a visible workspace -> we accept it.
-        // If this is the wrong window (not the one you were last on), macOS's own pick is the culprit.
-        if isAppActivation { cmdtabTrace(nativeFocused, "ACCEPT (macOS pick already on visible ws=\(nativeWorkspace.name))") }
+        if isAppActivation { focusTrace(cmdtabMsg(nativeFocused, "ACCEPT (macOS pick already on visible ws=\(nativeWorkspace.name))")) }
         return nativeFocused
     }
 
@@ -183,7 +181,7 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
 
     // Behavior 1: prefer an existing window of this app on a visible workspace. Redirect, move nothing.
     if let target = mostRecentWindowOnVisibleWorkspace(ofApp: pid) {
-        cmdtabTrace(nativeFocused, "REDIRECT to win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 1]")
+        focusTrace(cmdtabMsg(nativeFocused, "REDIRECT to win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 1]"))
         pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: pid, targetWindowId: target.windowId, attemptsLeft: 3)
         return target
     }
@@ -197,23 +195,19 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
         // workspace (layout untouched); tiled binds to the root tiling container (re-tiles -- hence opt-in).
         let container: NonLeafTreeNodeObject = nativeFocused.isFloating ? here : here.rootTilingContainer
         nativeFocused.bind(to: container, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
-        cmdtabTrace(nativeFocused, "SUMMON to ws=\(here.name) [behavior 3]")
+        focusTrace(cmdtabMsg(nativeFocused, "SUMMON to ws=\(here.name) [behavior 3]"))
         return nativeFocused
     }
 
     // Behavior 2: no visible window, not opted in => following is correct and desirable.
-    cmdtabTrace(nativeFocused, "FOLLOW/travel to ws=\(nativeWorkspace.name) [behavior 2]")
+    focusTrace(cmdtabMsg(nativeFocused, "FOLLOW/travel to ws=\(nativeWorkspace.name) [behavior 2]"))
     return nativeFocused
 }
 
-/// Cmd+Tab (app-activation) diagnostics: what window macOS picked on activation and what we did with it.
-/// Answers "why didn't tabbing back land on the window I was just on?" -- if macOS's pick is the wrong
-/// window, the fix is on our side (remember last-used window per app); if it's right but we redirect, it's
-/// behavior 1/3.
-@MainActor private func cmdtabTrace(_ nativeFocused: Window, _ decision: String) {
-    let ws = nativeFocused.nodeWorkspace?.name ?? "nil"
-    let app = nativeFocused.app.rawAppBundleId ?? "?"
-    b5trace("CMDTAB app=\(app) macOS-picked win=\(nativeFocused.windowId) ws=\(ws) -> \(decision)")
+/// One-line description of what macOS picked on activation, for focusTrace.
+@MainActor private func cmdtabMsg(_ nativeFocused: Window, _ decision: String) -> String {
+    "cmdtab app=\(nativeFocused.app.rawAppBundleId ?? "?") macOS-picked win=\(nativeFocused.windowId)"
+        + " ws=\(nativeFocused.nodeWorkspace?.name ?? "nil") -> \(decision)"
 }
 
 @MainActor
@@ -245,17 +239,17 @@ private func revealAppWindowOnActivation() {
 
     // Behavior 4: minimized-only app => un-minimize (native restore lands it on focus.workspace).
     if let minimized = mostRecentMinimizedWindow(ofApp: pid) {
-        b5trace("CMDTAB app=\(app) NIL -> un-minimize win=\(minimized.windowId) [behavior 4]")
+        focusTrace("cmdtab app=\(app) NIL -> un-minimize win=\(minimized.windowId) [behavior 4]")
         minimized.setNativeMinimized(false)
         return
     }
 
     // Behavior 4b: macOS gave nil but the app has real windows => reveal the one you were last on.
     guard let target = mostRecentWindowToReveal(ofApp: pid) else {
-        b5trace("CMDTAB app=\(app) NIL -> no window to reveal")
+        focusTrace("cmdtab app=\(app) NIL -> no window to reveal")
         return
     }
-    b5trace("CMDTAB app=\(app) NIL -> REVEAL win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 4b]")
+    focusTrace("cmdtab app=\(app) NIL -> REVEAL win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 4b]")
     _ = target.focusWindow()
     target.nativeFocus()
 }
