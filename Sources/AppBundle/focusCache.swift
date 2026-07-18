@@ -20,13 +20,15 @@ struct PendingRedirect {
     var attemptsLeft: Int
 }
 
-// Focus-decision tracing for development. No-op unless AEROSPACE_FOCUS_TRACE is set in the environment
-// (add it to launchd/com.workstation-ux.aerospace.plist, then restart via aerospace/rebuild-restart.sh).
-// When on, every focus decision below prints "FOCUS ..." to stderr -> ~/.local/state/.../aerospace.err.log.
-// The @autoclosure means the message string is only built when tracing is enabled, so it's free when off.
-let focusTraceEnabled = ProcessInfo.processInfo.environment["AEROSPACE_FOCUS_TRACE"] != nil
-func focusTrace(_ msg: @autoclosure () -> String) {
-    if focusTraceEnabled { fputs("FOCUS " + msg() + "\n", stderr) }
+// Focus-decision tracing for development. No-op unless the flag file exists -- toggle live, no restart:
+//   touch ~/.config/aerospace/focus-trace   # on      rm ~/.config/aerospace/focus-trace   # off
+// `focusTraceOn` is refreshed once per updateFocusCache (one stat/refresh); when off the @autoclosure
+// message isn't even built. Lines go to stderr -> ~/.local/state/workstation-ux/aerospace.err.log.
+@MainActor private var focusTraceOn = false
+private let focusTraceFlag = FileManager.default.homeDirectoryForCurrentUser
+    .appending(path: ".config/aerospace/focus-trace").path
+@MainActor func focusTrace(_ msg: @autoclosure () -> String) {
+    if focusTraceOn { fputs("FOCUS " + msg() + "\n", stderr) }
 }
 
 // Behavior 5: a minimize bumps macOS focus to another same-app window that may live on a hidden workspace,
@@ -107,6 +109,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
 ///                      (from nativeFocused to lastKnownNativeFocusedWindowId)
 /// Alternative names: takeFocusFromMacOs, syncFocusFromMacOs
 @MainActor func updateFocusCache(_ nativeFocused: Window?) {
+    focusTraceOn = FileManager.default.fileExists(atPath: focusTraceFlag) // dev toggle, one stat/refresh
     if nativeFocused?.parent is MacosPopupWindowsContainer {
         return
     }
