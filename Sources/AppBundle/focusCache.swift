@@ -11,7 +11,8 @@ import Foundation
 @MainActor var summonAppsOverrideForTests: Set<String>? = nil
 
 struct PendingRedirect {
-    let pid: Int32
+    let sourcePid: Int32   // app macOS focused (what we're redirecting *away* from)
+    let targetPid: Int32   // app of the window we're redirecting *to* (== sourcePid for same-app redirects)
     let targetWindowId: UInt32
     var attemptsLeft: Int
 }
@@ -57,19 +58,34 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
     recentBumps.removeAll { $0.ttlRefreshes <= 0 }
 }
 
-/// Phase A probe: on a non-activation follow to a hidden workspace (the bump scenario, or a deliberate
-/// switch), log whether a BumpEvent is present *right now*. Never changes focus.
-@MainActor private func b5probe(_ nativeFocused: Window, _ pid: Int32) {
+/// Behavior 5: a non-activation focus change landed on a hidden workspace. If a minimize/close just
+/// bumped us here, keep focus on the workspace we were on (the bump's recorded workspace) instead of
+/// following. Returns the window to redirect to, or nil to let the caller follow as before.
+///
+/// - No bump record => a deliberate ⌘`/click => follow (return nil).
+/// - Bump present => `here` = the bumped window's workspace. Prefer a same-app window on `here` (clean),
+///   else any window on `here` (cross-app -- keeps you put even if the app has nothing left here). If
+///   `here` is now empty, follow (return nil; the empty-workspace case is deferred).
+/// The bump is consumed on use. `here` may no longer be visible (delayed AX ordering: we already
+/// followed away) -- redirecting re-activates it, a one-frame flash; still better than staying dragged.
+@MainActor private func resolveBump(_ nativeFocused: Window, _ pid: Int32) -> Window? {
     let toWs = nativeFocused.nodeWorkspace?.name ?? "nil"
     guard let bump = recentBumps.last, !bump.workspaceName.isEmpty else {
-        b5trace("PROBE non-activation follow->ws=\(toWs) NO-BUMP (deliberate switch, or event not yet arrived)")
-        return
+        b5trace("BUMP none: non-activation follow->ws=\(toWs) (deliberate switch or not-yet-arrived) => follow")
+        return nil
     }
+    recentBumps.removeLast() // consume-on-use
     let here = Workspace.get(byName: bump.workspaceName)
-    let sameApp = here.mostRecentWindowRecursive(where: { $0.app.pid == pid })?.windowId
-    let anyWin = here.mostRecentWindowRecursive(where: { _ in true })?.windowId
-    b5trace("PROBE non-activation follow->ws=\(toWs) BUMP-PRESENT win=\(bump.windowId) here=\(bump.workspaceName) "
-        + "hereVisible=\(here.isVisible) wouldTarget sameApp=\(sameApp?.description ?? "nil") any=\(anyWin?.description ?? "nil")")
+    guard let target = here.mostRecentWindowRecursive(where: { $0.app.pid == pid })   // same app on `here`
+        ?? here.mostRecentWindowRecursive(where: { _ in true })                       // else anything on `here`
+    else {
+        b5trace("BUMP win=\(bump.windowId) here=\(bump.workspaceName) now empty => allow follow->ws=\(toWs)")
+        return nil
+    }
+    pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: target.app.pid, targetWindowId: target.windowId, attemptsLeft: 3)
+    b5trace("BUMP-REDIRECT win=\(bump.windowId) keep ws=\(bump.workspaceName) target=\(target.windowId)"
+        + " (macOS was following to ws=\(toWs); hereVisible=\(here.isVisible))")
+    return target
 }
 
 /// Reset every process-global this file owns. Called from setUpWorkspacesForTests so test order can't leak
@@ -138,8 +154,10 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
     // ---- macOS focused a window on a hidden workspace ----
 
     // A redirect we already issued hasn't been honored yet. Keep insisting (bounded). Crucially do NOT fall
-    // through to "follow macOS" while pending -- that would undo our own redirect one session later.
-    if var pending = pendingRedirect, pending.pid == pid, pending.attemptsLeft > 0,
+    // through to "follow macOS" while pending -- that would undo our own redirect one session later. Match
+    // on source OR target pid: a cross-app behavior-5 redirect (source != target) must keep retrying while
+    // macOS still reports the source app frontmost, until it catches up to the target.
+    if var pending = pendingRedirect, pending.sourcePid == pid || pending.targetPid == pid, pending.attemptsLeft > 0,
        let target = Window.get(byId: pending.targetWindowId), target.nodeWorkspace?.isVisible == true
     {
         pending.attemptsLeft -= 1
@@ -148,13 +166,13 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
     }
     pendingRedirect = nil
 
-    // App was already frontmost => user deliberately switched windows *within* the app (cmd-`, Window menu,
-    // clicking a corner-parked window). Honor it. (Behavior 5, Phase A: log only, still follows.)
-    guard isAppActivation else { b5probe(nativeFocused, pid); return nativeFocused }
+    // App was already frontmost. Either a deliberate within-app switch (cmd-`, Window menu) -> follow, or a
+    // minimize/close bumped focus here -> keep the workspace you were on (behavior 5).
+    guard isAppActivation else { return resolveBump(nativeFocused, pid) ?? nativeFocused }
 
     // Behavior 1: prefer an existing window of this app on a visible workspace. Redirect, move nothing.
     if let target = mostRecentWindowOnVisibleWorkspace(ofApp: pid) {
-        pendingRedirect = PendingRedirect(pid: pid, targetWindowId: target.windowId, attemptsLeft: 3)
+        pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: pid, targetWindowId: target.windowId, attemptsLeft: 3)
         return target
     }
 

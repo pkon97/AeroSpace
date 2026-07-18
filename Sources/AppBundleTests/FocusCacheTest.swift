@@ -146,25 +146,63 @@ final class FocusCacheTest: XCTestCase {
         assertEquals(focus.windowOrNil?.windowId, 2)
     }
 
-    // Behavior 5 Phase A: a bump record present during a non-activation follow must NOT change the
-    // outcome yet — Phase A only probes/logs; the redirect is Phase B.
-    func testPhaseAProbeDoesNotChangeFollow() {
+    // Behavior 5 (Phase B): a minimize bump keeps focus on the workspace you were on instead of
+    // following macOS to the hidden-workspace window it picked. (Same-app-vs-cross-app *preference*
+    // needs a second test app -- validated live; here every TestWindow shares TestApp, so this
+    // exercises the "window on `here`" redirect via the same-app branch.)
+    func testBumpKeepsFocusOnBumpWorkspace() {
         let visible = focus.workspace
         let hidden = Workspace.get(byName: "hidden-\(name)")
-        let w2 = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        let willMinimize = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        _ = TestWindow.new(id: 5, parent: visible.rootTilingContainer) // survivor on `here`
+        let bumpedTo = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+
+        updateFocusCache(willMinimize)
+        assertEquals(focus.windowOrNil?.windowId, 2)
+
+        // simulate the minimize: id 2 leaves the workspace tree; a bump is recorded for `visible`
+        willMinimize.bind(to: macosMinimizedWindowsContainer, adaptiveWeight: 1, index: INDEX_BIND_LAST)
+        recentBumps = [BumpEvent(windowId: 2, workspaceName: visible.name, ttlRefreshes: 2)]
+
+        updateFocusCache(bumpedTo) // macOS moved focus to hidden id 1
+
+        assertEquals(focus.windowOrNil?.windowId, 5) // redirected to the survivor on `here`, not id 1
+        assertEquals(focus.workspace, visible)       // stayed put
+        assertEquals(recentBumps.count, 0)           // consumed
+    }
+
+    // A non-activation switch with NO bump (a deliberate cmd-`/click) still travels, unchanged.
+    func testNoBumpNonActivationStillTravels() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        _ = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
         let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
 
-        updateFocusCache(w2) // activation; arms the frontmost pid
-        assertEquals(focus.workspace, visible)
+        updateFocusCache(TestWindow.new(id: 3, parent: visible.rootTilingContainer)) // activation
+        updateFocusCache(w1) // non-activation, no bump => deliberate switch => follow
 
-        recentBumps = [BumpEvent(windowId: 2, workspaceName: visible.name, ttlRefreshes: 2)]
-        updateFocusCache(w1) // same app, non-activation, hidden ws => Phase A logs, still follows
-
-        assertEquals(focus.windowOrNil?.windowId, 1) // traveled, exactly as before behavior 5
+        assertEquals(focus.windowOrNil?.windowId, 1)
         assertEquals(focus.workspace, hidden)
     }
 
-    // Behavior 5 Phase A: bump records age out by TTL so the queue can't grow unbounded.
+    // Empty bump workspace => nothing to keep focus on => allow the follow (deferred case). Bump still consumed.
+    func testEmptyBumpWorkspaceAllowsFollow() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        let empty = Workspace.get(byName: "empty-\(name)")
+        _ = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+
+        updateFocusCache(TestWindow.new(id: 3, parent: visible.rootTilingContainer))
+        recentBumps = [BumpEvent(windowId: 9, workspaceName: empty.name, ttlRefreshes: 2)]
+        updateFocusCache(w1) // here (empty) has no window => follow
+
+        assertEquals(focus.windowOrNil?.windowId, 1)
+        assertEquals(focus.workspace, hidden)
+        assertEquals(recentBumps.count, 0) // consumed even though we followed
+    }
+
+    // Behavior 5: bump records age out by TTL when never consumed (e.g. focus went to a visible window).
     func testBumpRecordsAgeOutByTtl() {
         let w = TestWindow.new(id: 1, parent: focus.workspace.rootTilingContainer)
         recentBumps = [BumpEvent(windowId: 9, workspaceName: focus.workspace.name, ttlRefreshes: 2)]
