@@ -16,6 +16,62 @@ struct PendingRedirect {
     var attemptsLeft: Int
 }
 
+// ---- Behavior 5, Phase A: instrumentation only (no redirect yet) ----
+// A minimize/close bumps macOS focus to another same-app window that may live on a hidden workspace,
+// dragging you there. Phase A records the minimize as a BumpEvent and LOGS, at the moment of the
+// resulting focus follow, whether the record was already present -- answering the open question of
+// whether the AX miniaturize event lands before or after the focus refresh. No behavior change yet.
+struct BumpEvent {
+    let windowId: UInt32
+    let workspaceName: String
+    var ttlRefreshes: Int
+}
+@MainActor var recentBumps: [BumpEvent] = []
+private let bumpTtlRefreshes = 2
+
+// Unbuffered so lines land in aerospace.err.log immediately (stdout under launchd is block-buffered).
+func b5trace(_ msg: @autoclosure () -> String) {
+    fputs("B5PHASEA " + msg() + "\n", stderr)
+}
+
+/// AX handler for `kAXWindowMiniaturizedNotification` (split out of refreshObs for Phase A). The element
+/// is still alive on a minimize, so `containingWindowId()` recovers the id; the window's `nodeWorkspace`
+/// is captured before normalizeLayoutReason re-parents it. Then refresh as usual, exactly like refreshObs.
+func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMutableRawPointer?) {
+    let windowId = ax.containingWindowId()
+    let notif = notif as String
+    Task { @MainActor in
+        if !TrayMenuModel.shared.isEnabled { return }
+        if let windowId {
+            let ws = Window.get(byId: windowId)?.nodeWorkspace?.name
+            recentBumps.append(BumpEvent(windowId: windowId, workspaceName: ws ?? "", ttlRefreshes: bumpTtlRefreshes))
+            b5trace("BUMP-EVENT miniaturize win=\(windowId) ws=\(ws ?? "nil") queued=\(recentBumps.count)")
+        }
+        scheduleRefreshSession(.ax(notif))
+    }
+}
+
+@MainActor private func ageBumpRecords() {
+    guard !recentBumps.isEmpty else { return }
+    for i in recentBumps.indices { recentBumps[i].ttlRefreshes -= 1 }
+    recentBumps.removeAll { $0.ttlRefreshes <= 0 }
+}
+
+/// Phase A probe: on a non-activation follow to a hidden workspace (the bump scenario, or a deliberate
+/// switch), log whether a BumpEvent is present *right now*. Never changes focus.
+@MainActor private func b5probe(_ nativeFocused: Window, _ pid: Int32) {
+    let toWs = nativeFocused.nodeWorkspace?.name ?? "nil"
+    guard let bump = recentBumps.last, !bump.workspaceName.isEmpty else {
+        b5trace("PROBE non-activation follow->ws=\(toWs) NO-BUMP (deliberate switch, or event not yet arrived)")
+        return
+    }
+    let here = Workspace.get(byName: bump.workspaceName)
+    let sameApp = here.mostRecentWindowRecursive(where: { $0.app.pid == pid })?.windowId
+    let anyWin = here.mostRecentWindowRecursive(where: { _ in true })?.windowId
+    b5trace("PROBE non-activation follow->ws=\(toWs) BUMP-PRESENT win=\(bump.windowId) here=\(bump.workspaceName) "
+        + "hereVisible=\(here.isVisible) wouldTarget sameApp=\(sameApp?.description ?? "nil") any=\(anyWin?.description ?? "nil")")
+}
+
 /// Reset every process-global this file owns. Called from setUpWorkspacesForTests so test order can't leak
 /// state (these globals persist across tests otherwise).
 @MainActor func resetFocusCacheForTests() {
@@ -24,6 +80,7 @@ struct PendingRedirect {
     pendingRedirect = nil
     summonAppsOverrideForTests = nil
     summonApps = nil
+    recentBumps = []
 }
 
 /// The data should flow (from nativeFocused to focused) and
@@ -57,6 +114,8 @@ struct PendingRedirect {
     if let effective, effective !== nativeFocused {
         effective.nativeFocus() // syncFocusToMacOs: macOS still believes nativeFocused has the focus
     }
+
+    ageBumpRecords() // Behavior 5, Phase A: TTL so the bump queue can't grow unbounded
 }
 
 /// macOS activates *applications*; the app then picks which window to focus from its own MRU, which knows
@@ -90,8 +149,8 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
     pendingRedirect = nil
 
     // App was already frontmost => user deliberately switched windows *within* the app (cmd-`, Window menu,
-    // clicking a corner-parked window). Honor it.
-    guard isAppActivation else { return nativeFocused }
+    // clicking a corner-parked window). Honor it. (Behavior 5, Phase A: log only, still follows.)
+    guard isAppActivation else { b5probe(nativeFocused, pid); return nativeFocused }
 
     // Behavior 1: prefer an existing window of this app on a visible workspace. Redirect, move nothing.
     if let target = mostRecentWindowOnVisibleWorkspace(ofApp: pid) {

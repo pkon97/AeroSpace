@@ -145,4 +145,33 @@ final class FocusCacheTest: XCTestCase {
         assertEquals(minimized.lastSetNativeMinimized, nil) // behavior 4 did not fire
         assertEquals(focus.windowOrNil?.windowId, 2)
     }
+
+    // Behavior 5 Phase A: a bump record present during a non-activation follow must NOT change the
+    // outcome yet — Phase A only probes/logs; the redirect is Phase B.
+    func testPhaseAProbeDoesNotChangeFollow() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        let w2 = TestWindow.new(id: 2, parent: visible.rootTilingContainer)
+        let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+
+        updateFocusCache(w2) // activation; arms the frontmost pid
+        assertEquals(focus.workspace, visible)
+
+        recentBumps = [BumpEvent(windowId: 2, workspaceName: visible.name, ttlRefreshes: 2)]
+        updateFocusCache(w1) // same app, non-activation, hidden ws => Phase A logs, still follows
+
+        assertEquals(focus.windowOrNil?.windowId, 1) // traveled, exactly as before behavior 5
+        assertEquals(focus.workspace, hidden)
+    }
+
+    // Behavior 5 Phase A: bump records age out by TTL so the queue can't grow unbounded.
+    func testBumpRecordsAgeOutByTtl() {
+        let w = TestWindow.new(id: 1, parent: focus.workspace.rootTilingContainer)
+        recentBumps = [BumpEvent(windowId: 9, workspaceName: focus.workspace.name, ttlRefreshes: 2)]
+
+        updateFocusCache(w) // 2 -> 1
+        assertEquals(recentBumps.count, 1)
+        updateFocusCache(w) // 1 -> 0, dropped
+        assertEquals(recentBumps.count, 0)
+    }
 }

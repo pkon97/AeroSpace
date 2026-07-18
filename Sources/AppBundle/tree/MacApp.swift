@@ -346,7 +346,10 @@ private final class AxWindow {
 
     static func new(windowId: UInt32, _ ax: AXUIElement, _ nsApp: NSRunningApplication, _ job: RunLoopJob) throws -> AxWindow? {
         let handlers: HandlerToNotifKeyMapping = [
-            (refreshObs, [kAXUIElementDestroyedNotification, kAXWindowDeminiaturizedNotification, kAXWindowMiniaturizedNotification]),
+            // Behavior 5, Phase A: miniaturize routed to bumpObs (records a bump event, then refreshes as
+            // refreshObs would). destroy/deminiaturize stay on refreshObs (destroy needs a refcon -- Phase C).
+            (refreshObs, [kAXUIElementDestroyedNotification, kAXWindowDeminiaturizedNotification]),
+            (bumpObs, [kAXWindowMiniaturizedNotification]),
             (movedObs, [kAXMovedNotification]),
             (resizedObs, [kAXResizedNotification]),
         ]
