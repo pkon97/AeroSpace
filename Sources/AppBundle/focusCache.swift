@@ -234,6 +234,18 @@ private func restoreMinimizedWindowOnActivation() {
     let isAppActivation = pid != lastKnownFrontmostAppPid
     lastKnownFrontmostAppPid = pid
     guard isAppActivation else { return }
+
+    // Diagnostics: macOS activated an app but handed us NO focused window (e.g. Finder focusing its
+    // desktop). Log where the app's real windows actually are -- if they sit on other workspaces while
+    // we do nothing, that's the "Cmd+Tab lands on no window" symptom.
+    let onWorkspaces = Workspace.all.flatMap { ws in
+        ws.allLeafWindowsRecursive.filter { $0.app.pid == pid }.map { "\($0.windowId)@\(ws.name)" }
+    }
+    let minimized = macosMinimizedWindowsContainer.mruChildren.compactMap { $0 as? Window }
+        .filter { $0.app.pid == pid }.map { $0.windowId }
+    b5trace("CMDTAB app=\(frontmost.bundleIdentifier ?? "?") macOS-picked NIL (no window)"
+        + " -> app windows on workspaces=\(onWorkspaces) minimized=\(minimized)")
+
     restoreMostRecentMinimizedWindow(ofApp: pid)
 }
 
