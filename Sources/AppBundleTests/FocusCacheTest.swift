@@ -180,7 +180,7 @@ final class FocusCacheTest: XCTestCase {
 
         // simulate the minimize: id 2 leaves the workspace tree; a bump is recorded for `visible`
         willMinimize.bind(to: macosMinimizedWindowsContainer, adaptiveWeight: 1, index: INDEX_BIND_LAST)
-        recentBumps = [BumpEvent(windowId: 2, workspaceName: visible.name, ttlRefreshes: 2)]
+        recentBumps = [BumpEvent(windowId: 2, pid: TestApp.shared.pid, workspaceName: visible.name, ttlRefreshes: 3)]
 
         updateFocusCache(bumpedTo) // macOS moved focus to hidden id 1
 
@@ -212,7 +212,7 @@ final class FocusCacheTest: XCTestCase {
         let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
 
         updateFocusCache(TestWindow.new(id: 3, parent: visible.rootTilingContainer))
-        recentBumps = [BumpEvent(windowId: 9, workspaceName: empty.name, ttlRefreshes: 2)]
+        recentBumps = [BumpEvent(windowId: 9, pid: TestApp.shared.pid, workspaceName: empty.name, ttlRefreshes: 3)]
         updateFocusCache(w1) // here (empty) has no window => follow
 
         assertEquals(focus.windowOrNil?.windowId, 1)
@@ -223,11 +223,78 @@ final class FocusCacheTest: XCTestCase {
     // Behavior 5: bump records age out by TTL when never consumed (e.g. focus went to a visible window).
     func testBumpRecordsAgeOutByTtl() {
         let w = TestWindow.new(id: 1, parent: focus.workspace.rootTilingContainer)
-        recentBumps = [BumpEvent(windowId: 9, workspaceName: focus.workspace.name, ttlRefreshes: 2)]
+        recentBumps = [BumpEvent(windowId: 9, pid: TestApp.shared.pid, workspaceName: focus.workspace.name, ttlRefreshes: 2)]
 
         updateFocusCache(w) // 2 -> 1
         assertEquals(recentBumps.count, 1)
         updateFocusCache(w) // 1 -> 0, dropped
         assertEquals(recentBumps.count, 0)
     }
+
+    // THE regression test (the one the old suite structurally missed): reproduce the native race -- the
+    // minimizing window is still IN THE TREE and still MRU when the bump-driven refresh runs. resolveBump
+    // must NOT re-select it (that re-selection + nativeFocus is what un-minimized it -> phantom tile).
+    func testBumpDoesNotReselectMinimizingWindow() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        _ = TestWindow.new(id: 2, parent: visible.rootTilingContainer) // A: minimizing but STILL IN TREE
+        _ = TestWindow.new(id: 5, parent: visible.rootTilingContainer) // survivor on `here`
+        let bumpedTo = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+
+        updateFocusCache(Window.get(byId: 2)) // A focused => A is MRU on `visible`
+        assertEquals(focus.windowOrNil?.windowId, 2)
+
+        // A is minimizing; a bump is recorded, but A is NOT moved out of the tree (that's the race).
+        recentBumps = [BumpEvent(windowId: 2, pid: TestApp.shared.pid, workspaceName: visible.name, ttlRefreshes: 3)]
+        updateFocusCache(bumpedTo) // macOS bounced focus to hidden B
+
+        assertNotEquals(focus.windowOrNil?.windowId, 2)     // did NOT re-select the minimizing window
+        assertEquals(focus.windowOrNil?.windowId, 5)        // picked the survivor instead
+        assertNotEquals(pendingRedirect?.targetWindowId, 2) // and pendingRedirect isn't clinging to it
+    }
+
+    // An empty-workspace bump (the racy ws="" case) must not shadow a valid bump underneath it.
+    func testEmptyBumpDoesNotShadowValidBump() {
+        let visible = focus.workspace
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        _ = TestWindow.new(id: 5, parent: visible.rootTilingContainer)
+        let bumpedTo = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+
+        updateFocusCache(TestWindow.new(id: 3, parent: visible.rootTilingContainer)) // arm pid, focus on visible
+        recentBumps = [
+            BumpEvent(windowId: 7, pid: TestApp.shared.pid, workspaceName: visible.name, ttlRefreshes: 3), // valid
+            BumpEvent(windowId: 8, pid: TestApp.shared.pid, workspaceName: "", ttlRefreshes: 3),           // empty on top
+        ]
+        updateFocusCache(bumpedTo)
+
+        assertEquals(focus.workspace, visible) // stayed put via the valid bump; empty one didn't shadow it
+    }
+
+    // A confirmed nil-focus activation clears a stale pendingRedirect.
+    func testPendingRedirectClearedOnNilActivation() {
+        pendingRedirect = PendingRedirect(sourcePid: 0, targetPid: 0, targetWindowId: 42, attemptsLeft: 3)
+        lastKnownFrontmostAppPid = nil // make the nil-focus refresh look like an activation
+
+        updateFocusCache(nil)
+
+        assertNil(pendingRedirect)
+    }
+
+    // Behavior 4b must not reveal a window that is currently minimizing (even if it's the remembered one).
+    func testRevealSkipsMinimizingWindow() {
+        let visible = focus.workspace
+        _ = TestWindow.new(id: 2, parent: visible.rootTilingContainer) // in-tree but minimizing
+        _ = TestWindow.new(id: 5, parent: visible.rootTilingContainer)
+        appLastFocusedWindow[TestApp.shared.pid] = 2 // remembered = the minimizing one
+        recentBumps = [BumpEvent(windowId: 2, pid: TestApp.shared.pid, workspaceName: visible.name, ttlRefreshes: 3)]
+
+        let target = mostRecentWindowToReveal(ofApp: TestApp.shared.pid)
+
+        assertNotEquals(target?.windowId, 2) // skipped the minimizing window
+        assertEquals(target?.windowId, 5)
+    }
+
+    // NOTE: testBumpAppliesOnlyToItsApp (a bump for pid X must not redirect a focus change of pid Y) is
+    // blocked on a second-TestApp seam -- TestWindow is hardwired to TestApp.shared (single pid). The
+    // pid correlation is covered by design (resolveBump's `lastIndex(where: pid ==)`); add the seam to test.
 }

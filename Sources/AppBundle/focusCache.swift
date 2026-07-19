@@ -35,23 +35,28 @@ private let focusTraceFlag = FileManager.default.homeDirectoryForCurrentUser
 // dragging you there. bumpObs records the minimize as a BumpEvent; resolveBump uses it to keep you put.
 struct BumpEvent {
     let windowId: UInt32
+    let pid: Int32          // app of the minimized window, so a bump only applies to its own app
     let workspaceName: String
     var ttlRefreshes: Int
 }
 @MainActor var recentBumps: [BumpEvent] = []
-private let bumpTtlRefreshes = 2
+private let bumpTtlRefreshes = 3 // slack for AX-notification latency (was 2)
 
-/// AX handler for `kAXWindowMiniaturizedNotification` (split out of refreshObs). The element is still alive
-/// on a minimize, so `containingWindowId()` recovers the id; the window's `nodeWorkspace` is captured before
-/// normalizeLayoutReason re-parents it. Then refresh as usual, exactly like refreshObs.
+/// AX handler for `kAXWindowMiniaturizedNotification` (split out of refreshObs). `containingWindowId()` is
+/// callback-safe; the tree reads (`Window.get`/`nodeWorkspace`) are @MainActor so they happen after the hop.
+/// If the window was already re-parented out of its workspace by the time we read (ws == nil), recover the
+/// workspace ONLY when this window was the focused one -- the normal case (you minimize the focused window)
+/// -- so behavior 5 stops recording ws="" without ever guessing a wrong workspace.
 func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMutableRawPointer?) {
     let windowId = ax.containingWindowId()
     let notif = notif as String
     Task { @MainActor in
         if !TrayMenuModel.shared.isEnabled { return }
         if let windowId {
-            let ws = Window.get(byId: windowId)?.nodeWorkspace?.name
-            recentBumps.append(BumpEvent(windowId: windowId, workspaceName: ws ?? "", ttlRefreshes: bumpTtlRefreshes))
+            let w = Window.get(byId: windowId)
+            var ws = w?.nodeWorkspace?.name
+            if ws == nil, focus.windowOrNil?.windowId == windowId { ws = focus.workspace.name }
+            recentBumps.append(BumpEvent(windowId: windowId, pid: w?.app.pid ?? 0, workspaceName: ws ?? "", ttlRefreshes: bumpTtlRefreshes))
             focusTrace("bump-event miniaturize win=\(windowId) ws=\(ws ?? "nil") queued=\(recentBumps.count)")
         }
         scheduleRefreshSession(.ax(notif))
@@ -76,17 +81,23 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
 /// followed away) -- redirecting re-activates it, a one-frame flash; still better than staying dragged.
 @MainActor private func resolveBump(_ nativeFocused: Window, _ pid: Int32) -> Window? {
     let toWs = nativeFocused.nodeWorkspace?.name ?? "nil"
-    guard let bump = recentBumps.last, !bump.workspaceName.isEmpty else {
-        focusTrace("bump none: non-activation follow->ws=\(toWs) (deliberate switch or not-yet-arrived) => follow")
+    // Every queued bump is a window that is minimizing (still possibly in-tree during the race, refresh.swift
+    // runs updateFocusCache before normalizeLayoutReason). Exclude ALL of them from target selection so we can
+    // never re-select the very window being minimized (the phantom-tile bug). Built BEFORE purging empties,
+    // since an empty-workspace bump can still represent another mid-minimize window.
+    let minimizingWindowIds = Set(recentBumps.map(\.windowId))
+    recentBumps.removeAll { $0.workspaceName.isEmpty } // drop invalid so they can't shadow a valid bump
+    guard let i = recentBumps.lastIndex(where: { $0.pid == pid }) else { // correlate: a bump only applies to its own app
+        focusTrace("bump none: non-activation follow->ws=\(toWs) (deliberate switch or no valid bump for pid) => follow")
         return nil
     }
-    recentBumps.removeLast() // consume-on-use
+    let bump = recentBumps.remove(at: i) // consume THIS bump
     let here = Workspace.get(byName: bump.workspaceName)
-    guard let target = here.mostRecentWindowRecursive(where: { $0.app.pid == pid })   // same app on `here`
-        ?? here.mostRecentWindowRecursive(where: { _ in true })                       // else anything on `here`
+    guard let target = here.mostRecentWindowRecursive(where: { $0.app.pid == pid && !minimizingWindowIds.contains($0.windowId) })
+        ?? here.mostRecentWindowRecursive(where: { !minimizingWindowIds.contains($0.windowId) })
     else {
-        focusTrace("bump win=\(bump.windowId) here=\(bump.workspaceName) now empty => allow follow->ws=\(toWs)")
-        return nil // `here` now empty => allow follow (deferred empty-workspace case)
+        focusTrace("bump win=\(bump.windowId) here=\(bump.workspaceName) nothing else to keep => allow follow->ws=\(toWs)")
+        return nil // `here` empty of non-minimizing windows => allow follow (deferred empty-workspace case)
     }
     pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: target.app.pid, targetWindowId: target.windowId, attemptsLeft: 3)
     focusTrace("bump-redirect win=\(bump.windowId) keep ws=\(bump.workspaceName) target=\(target.windowId)")
@@ -239,6 +250,7 @@ private func revealAppWindowOnActivation() {
     lastKnownFrontmostAppPid = pid
     guard isAppActivation else { return }
     let app = frontmost.bundleIdentifier ?? "?"
+    pendingRedirect = nil // a confirmed fresh activation must not inherit a stale redirect (not on transient nils)
 
     // Behavior 4: minimized-only app => un-minimize (native restore lands it on focus.workspace).
     if let minimized = mostRecentMinimizedWindow(ofApp: pid) {
@@ -264,16 +276,22 @@ func mostRecentMinimizedWindow(ofApp pid: Int32) -> Window? {
 
 /// The app's window to reveal when macOS focused none: the exact window you were last on (per-app memory)
 /// if it still exists; else its MRU on the current visible workspace (no travel); else its MRU anywhere.
+/// Travel-to-hidden is intended (behavior 4b's whole point), but a window that is currently minimizing must
+/// be skipped so we don't re-focus/un-minimize it (same race as resolveBump).
 /// `internal` so behavior 4b is unit-testable without NSWorkspace (which reports the test runner).
 @MainActor
 func mostRecentWindowToReveal(ofApp pid: Int32) -> Window? {
-    if let last = appLastFocusedWindow[pid].flatMap({ Window.get(byId: $0) }), last.nodeWorkspace != nil {
+    let minimizingWindowIds = Set(recentBumps.map(\.windowId))
+    func ok(_ w: Window) -> Bool { w.app.pid == pid && !minimizingWindowIds.contains(w.windowId) }
+    if let id = appLastFocusedWindow[pid], !minimizingWindowIds.contains(id),
+       let last = Window.get(byId: id), last.nodeWorkspace != nil
+    {
         return last
     }
-    if focus.workspace.isVisible, let here = focus.workspace.mostRecentWindowRecursive(where: { $0.app.pid == pid }) {
+    if focus.workspace.isVisible, let here = focus.workspace.mostRecentWindowRecursive(where: ok) {
         return here
     }
-    return Workspace.all.lazy.compactMap { $0.mostRecentWindowRecursive(where: { $0.app.pid == pid }) }.first
+    return Workspace.all.lazy.compactMap { $0.mostRecentWindowRecursive(where: ok) }.first
 }
 
 @MainActor private var summonApps: (mtime: Date, ids: Set<String>)? = nil
