@@ -156,7 +156,7 @@ func bumpObs(_ obs: AXObserver, ax: AXUIElement, notif: CFString, data: UnsafeMu
 /// macOS activates *applications*; the app then picks which window to focus from its own MRU, which knows
 /// nothing about AeroSpace workspaces (MacApp.getFocusedWindow reads Ax.focusedWindowAttr). So cmd-tab-ing
 /// to Finder can land on a hidden-workspace window and drag the user there. When that happens *as part of
-/// activating the app*, prefer a window of that app on a visible workspace; or, for opted-in apps, bring
+/// activating the app*, prefer a window of that app on the focused workspace; or, for opted-in apps, bring
 /// the window to the user instead of following it away.
 @MainActor
 private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) -> Window? {
@@ -193,8 +193,8 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
     // minimize/close bumped focus here -> keep the workspace you were on (behavior 5).
     guard isAppActivation else { return resolveBump(nativeFocused, pid) ?? nativeFocused }
 
-    // Behavior 1: prefer an existing window of this app on a visible workspace. Redirect, move nothing.
-    if let target = mostRecentWindowOnVisibleWorkspace(ofApp: pid) {
+    // Behavior 1: prefer an existing window of this app on the workspace you're on. Redirect, move nothing.
+    if let target = mostRecentWindowOnFocusedWorkspace(ofApp: pid) {
         focusTrace(cmdtabMsg(nativeFocused, "REDIRECT to win=\(target.windowId) ws=\(target.nodeWorkspace?.name ?? "?") [behavior 1]"))
         pendingRedirect = PendingRedirect(sourcePid: pid, targetPid: pid, targetWindowId: target.windowId, attemptsLeft: 3)
         return target
@@ -224,17 +224,21 @@ private func resolveFocusPreferringVisibleWorkspace(_ nativeFocused: Window?) ->
         + " ws=\(nativeFocused.nodeWorkspace?.name ?? "nil") -> \(decision)"
 }
 
+/// The app's most-recent window on the workspace you are actually looking at -- deliberately NOT "any visible
+/// workspace". On a multi-monitor setup every other monitor's active workspace is visible too, so the old
+/// `Workspace.all.filter { $0.isVisible }` fallback redirected focus onto *another monitor*: that changes the
+/// focused workspace (and drags the mouse with on-focused-monitor-changed), i.e. it travels -- the very yank
+/// behavior 1 exists to prevent, just to a different destination. It also shadowed macOS's own pick: a window
+/// you deliberately moved to a hidden workspace stayed unreachable by activation for as long as any sibling
+/// window of that app sat on some other monitor (the Finder case -- you kept landing back on the old window).
+/// No window on the focused workspace => fall through to behavior 2/3 (follow, or summon for opted-in apps).
 @MainActor
-private func mostRecentWindowOnVisibleWorkspace(ofApp pid: Int32) -> Window? {
+private func mostRecentWindowOnFocusedWorkspace(ofApp pid: Int32) -> Window? {
     let focused = focus.workspace
     // focus.workspace is not *guaranteed* visible: setFocus propagates setActiveWorkspace's Bool, which can
     // be false. So check rather than assume.
-    var candidates: [Workspace] = focused.isVisible ? [focused] : []
-    candidates += Workspace.all.filter { $0.isVisible && $0 != focused } // Workspace.all is sorted => stable
-    for workspace in candidates {
-        if let window = workspace.mostRecentWindowRecursive(where: { $0.app.pid == pid }) { return window }
-    }
-    return nil
+    guard focused.isVisible else { return nil }
+    return focused.mostRecentWindowRecursive(where: { $0.app.pid == pid })
 }
 
 /// The focused window was nil (macOS activated an app but gave us no window -- e.g. Finder focusing its

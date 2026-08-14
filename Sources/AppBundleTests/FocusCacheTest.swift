@@ -37,6 +37,28 @@ final class FocusCacheTest: XCTestCase {
         assertEquals(focus.workspace, hidden)
     }
 
+    // Behavior 1 is scoped to the workspace you are ON, not "any visible workspace". On a multi-monitor setup
+    // every other monitor's active workspace is visible too, so redirecting there travels anyway (it changes
+    // the focused workspace and drags the mouse) AND shadows macOS's own pick -- a window you moved to a hidden
+    // workspace became unreachable by activation while a sibling sat on another monitor (the Finder bug).
+    // The harness has one monitor, so "visible but not the workspace you're focused on" is modelled by pointing
+    // that monitor elsewhere; it exercises the same guard (`focus.workspace` is not the redirect candidate).
+    func testDoesNotRedirectToAWindowOnANonFocusedWorkspace() {
+        let elsewhere = Workspace.get(byName: "elsewhere-\(name)")
+        let hidden = Workspace.get(byName: "hidden-\(name)")
+        TestWindow.new(id: 2, parent: elsewhere.rootTilingContainer) // the app also has a window over there
+        let w1 = TestWindow.new(id: 1, parent: hidden.rootTilingContainer)
+        check(mainMonitor.setActiveWorkspace(elsewhere)) // visible -- but not where focus is
+        assertEquals(focus.workspace.isVisible, false)
+        assertEquals(elsewhere.isVisible, true)
+        lastKnownFrontmostAppPid = nil // arm "app activation"
+
+        updateFocusCache(w1) // macOS picked the hidden-workspace window
+
+        assertEquals(focus.windowOrNil?.windowId, 1) // honored macOS's pick, no cross-workspace redirect
+        assertEquals(focus.workspace, hidden)
+    }
+
     // Behavior 3: an opted-in app with no visible window => bring its window to the focused workspace.
     func testSummonsListedAppWindowToFocusedWorkspace() {
         let visible = focus.workspace
